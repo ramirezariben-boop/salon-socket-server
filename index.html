@@ -339,8 +339,8 @@
       // paredes
       const leftX = -12.95, rightX = 12.95; const baseY = 3.6; const baseZ = -6; const dz = 5;
       for(let i=0;i<3;i++){
-        makePoster(leftX, baseY, baseZ + i*dz, Math.PI/2, 2.5, 3.3, `img/left${i}.jpg`);
-        makePoster(rightX, baseY, baseZ + i*dz, -Math.PI/2, 2.5, 3.3, `img/right${i}.jpg`);
+        makePoster(leftX, baseY, baseZ + i*dz, Math.PI/2, 2.5, 3.3, `/img/left${i}.jpg`);
+        makePoster(rightX, baseY, baseZ + i*dz, -Math.PI/2, 2.5, 3.3, `/img/right${i}.jpg`);
       }
       // pared trasera
       makePoster(0, 5, 13.95, Math.PI, 6, 3.6, 'img/back.jpg');
