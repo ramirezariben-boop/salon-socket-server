@@ -4,29 +4,32 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Salón de Clases Virtual — 22 Bancas con Bloqueo en Tiempo Real</title>
-
-  <!-- Three.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
+  <!-- Socket.IO del servidor (mismo origen). Si no hay servidor, entra en modo demo. -->
+  <script>
+    // Intento temprano de detectar Socket.IO; si no carga desde /socket.io/socket.io.js,
+    // lo intentamos de nuevo tras DOMContentLoaded y activamos modo demo si falla.
+  </script>
   <style>
     body { margin: 0; padding: 0; background: #0f1115; font-family: Arial, sans-serif; overflow: hidden; color: #fff; }
     #container { width: 100vw; height: 100vh; position: relative; }
     #controls { position: absolute; top: 16px; left: 16px; z-index: 100; background: rgba(0,0,0,0.85); color: #fff; padding: 14px; border-radius: 10px; max-width: 320px; }
     .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
-    .desk-button { padding: 8px 10px; background: #4a90e2; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 12px; transition: .15s; text-align: center; }
+    .desk-button { padding: 8px 10px; background: #4a90e2; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 12px; transition: .15s transform,.15s background; text-align: center; }
     .desk-button:hover { transform: translateY(-1px); background: #357abd; }
     .desk-button.current { background: #27ae60; box-shadow: 0 0 10px rgba(39,174,96,.6); }
     .desk-button.occupied { background: #e74c3c; cursor: not-allowed; }
+    .row-label { display: block; color: #bbb; font-size: 12px; margin: 10px 0 6px; font-weight: bold; }
     .teacher-button { display: block; width: 100%; margin: 8px 0 10px; padding: 10px; background: #f39c12; border: 0; border-radius: 6px; color: #fff; font-weight: 700; cursor: pointer; }
     .teacher-button:hover { background: #e67e22; }
     #info { position: absolute; bottom: 16px; left: 16px; z-index: 100; background: rgba(0,0,0,0.7); color: #fff; padding: 12px 14px; border-radius: 8px; max-width: 360px; }
     #status { position: absolute; top: 16px; right: 16px; z-index: 100; background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 8px; min-width: 260px; }
     .status-ok { color: #7fffb3; }
     .status-warn { color: #ffd166; }
+    .status-err { color: #ff6b6b; }
   </style>
 </head>
 <body>
-
   <div id="container">
     <div id="controls">
       <h3 style="margin:0 0 8px">🎓 Seleccionar Banca (22 lugares)</h3>
@@ -36,16 +39,13 @@
 
     <div id="status">Estado: <span id="statusText" class="status-warn">Iniciando…</span></div>
 
-    <div id="info">
-      <strong>Vista actual:</strong> <span id="currentView">—</span><br>
-      <strong>Posición:</strong> <span id="currentPosition">—</span><br><br>
-      <small>💡 Haz clic en una banca para tomarla. Las bancas ocupadas se bloquean en tiempo real. Arrastra con el mouse para mirar alrededor.</small>
-    </div>
+    <div id="info"><strong>Vista actual:</strong> <span id="currentView">—</span><br><strong>Posición:</strong> <span id="currentPosition">—</span><br><br><small>💡 Haz clic en una banca para tomarla. Las bancas ocupadas se bloquean en tiempo real. Arrastra con el mouse para mirar alrededor.</small></div>
   </div>
 
   <script>
     // =====================
-    // CONFIGURACIÓN DE ASIENTOS
+    // CONFIGURACIÓN DE ASIENTOS (22 bancas)
+    // Distribución: 4 filas (A–D), 6 columnas (1–6) = 24 posiciones; se usan 22 (últimas 2 no creadas)
     // =====================
     const ROWS = ['A','B','C','D'];
     const COLS = [1,2,3,4,5,6];
@@ -53,40 +53,77 @@
 
     function generateSeatIds(){
       const ids = [];
-      for(const r of ROWS) for(const c of COLS) ids.push(`${r}${c}`);
+      for(const r of ROWS){
+        for(const c of COLS){ ids.push(`${r}${c}`); }
+      }
       return ids.slice(0, ACTIVE_SEAT_COUNT);
     }
+
     const SEAT_IDS = generateSeatIds();
 
     // =====================
-    // VARIABLES GLOBALES
+    // VARIABLES GLOBALES DE ESCENA
     // =====================
     let scene, camera, renderer;
-    const deskPositions = {};
-    let currentSeatId = null;
+    const deskPositions = {}; // seatId -> {x,y,z}
+    let currentSeatId = null; // asiento tomado por este cliente
     let isTeacherView = false;
+
+    // =====================
+    // SOCKET / SINCRONIZACIÓN
+    // =====================
     let socket = null;
     let connectedToServer = false;
-    let occupancy = {};
+    let occupancy = {}; // seatId -> { occupied: boolean, by: string|null }
 
+    // =====================
+    // UI ELEMENTS
+    // =====================
     const statusEl = document.getElementById('statusText');
     const gridEl = document.getElementById('seatsGrid');
     const teacherBtn = document.getElementById('teacherBtn');
 
     // =====================
-    // INIT
+    // DECLARACIÓN DE FUNCIONES EXPORTADAS (para botones)
+    // =====================
+    function setDeskViewById(seatId){
+      const pos = deskPositions[seatId];
+      if(!pos) return;
+      isTeacherView = false;
+      currentSeatId = seatId;
+      const look = getFrontLookVector();
+      animateCameraTo(pos.x, pos.y, pos.z, look.x, look.y, look.z);
+      updateCurrentView();
+      refreshSeatButtons();
+    }
+
+    function setTeacherView(){
+      isTeacherView = true;
+      animateCameraTo(0, 1.8, -10, 0, 1.2, 8);
+      updateCurrentView();
+      refreshSeatButtons();
+    }
+
+    window.setTeacherView = setTeacherView; // por si lo usamos en HTML en el futuro
+
+    // =====================
+    // INICIALIZACIÓN
     // =====================
     window.addEventListener('DOMContentLoaded', () => {
       buildSeatButtons();
       initScene();
       tryConnectSocket();
-      teacherBtn.addEventListener("click", setTeacherView);
-      setTimeout(setTeacherView, 80);
+      attachUIHandlers();
+      setTimeout(()=>{ setTeacherView(); }, 50);
+      runSelfTests();
     });
 
-    // =====================
-    // SEATS UI
-    // =====================
+    function attachUIHandlers(){
+      teacherBtn.addEventListener('click', () => {
+        setTeacherView();
+      });
+    }
+
     function buildSeatButtons(){
       gridEl.innerHTML = '';
       for(const seatId of SEAT_IDS){
@@ -100,74 +137,87 @@
     }
 
     function handleSeatClick(seatId){
+      // Si no hay servidor, modo demo: solo vista local (no bloqueo real)
       if(!connectedToServer){
         setDeskViewById(seatId);
         return;
       }
-
+      // Si está ocupada por otro, no se puede
       const occ = occupancy[seatId];
-      if(occ?.occupied && occ.by !== socket.id) return;
+      if(occ?.occupied && occ.by !== socket.id){ return; }
+      if(currentSeatId === seatId){ return; } // ya la tengo
 
-      socket.emit("request_seat", { seatId });
+      // Solicitar asiento al servidor
+      socket.emit('request_seat', { seatId });
     }
 
     function refreshSeatButtons(){
       for(const seatId of SEAT_IDS){
         const btn = document.getElementById(`btn-${seatId}`);
-        const occ = occupancy[seatId];
-
+        if(!btn) continue;
         btn.classList.remove('current','occupied');
-
+        const occ = occupancy[seatId];
         if(occ?.occupied){
-          if(occ.by === socket?.id) btn.classList.add('current');
-          else btn.classList.add('occupied');
+          if(occ.by === socket?.id){ btn.classList.add('current'); }
+          else { btn.classList.add('occupied'); }
+        } else if(currentSeatId === seatId && !connectedToServer){
+          // Modo demo: marcar la que elegí como current
+          btn.classList.add('current');
         }
       }
     }
 
     // =====================
-    // SOCKET.IO
+    // SOCKET.IO CLIENTE
     // =====================
     function tryConnectSocket(){
-      const s = document.createElement("script");
-
- s.src = "https://salon-socket-server.onrender.com/socket.io/socket.io.js";
-
-
+      // Inyectar script de Socket.IO del servidor (mismo origen)
+      const s = document.createElement('script');
+      s.src = 'https://salon-socket-server.onrender.com/socket.io/socket.io.js';
       s.onload = setupSocket;
-      s.onerror = () => {
+      s.onerror = ()=>{
         connectedToServer = false;
-        statusEl.textContent = "Modo DEMO: sin servidor";
+        statusEl.textContent = 'Modo DEMO: sin servidor (no hay bloqueo real)';
+        statusEl.className = 'status-warn';
         refreshSeatButtons();
       };
       document.head.appendChild(s);
     }
 
     function setupSocket(){
-      if(!window.io) return;
-
+      if(!window.io){ return; }
       socket = window.io("https://salon-socket-server.onrender.com");
 
-      socket.on("connect", () => {
+
+      socket.on('connect', ()=>{
         connectedToServer = true;
-        statusEl.textContent = "Conectado al servidor";
-        statusEl.className = "status-ok";
+        statusEl.textContent = 'Conectado al servidor: bloqueo de bancas activo';
+        statusEl.className = 'status-ok';
       });
 
-      socket.on("state", (serverState)=>{
-        occupancy = serverState.occupancy;
+      socket.on('state', (serverState)=>{
+        // serverState: { occupancy: { seatId: { occupied, by } } }
+        occupancy = serverState.occupancy || {};
         refreshSeatButtons();
       });
 
-      socket.on("seat_granted", ({ seatId })=>{
-        occupancy[seatId] = { occupied:true, by:socket.id };
+      socket.on('seat_granted', ({ seatId })=>{
+        // servidor nos asignó la banca
+        // actualiza occupancy localmente, luego mueve la cámara
+        occupancy[seatId] = { occupied: true, by: socket.id };
         currentSeatId = seatId;
         setDeskViewById(seatId);
         refreshSeatButtons();
       });
 
-      socket.on("seat_update", ({ seatId, occupied, by })=>{
+      socket.on('seat_denied', ({ seatId })=>{
+        // otro ya la tomó
+        refreshSeatButtons();
+      });
+
+      socket.on('seat_update', ({ seatId, occupied, by })=>{
         occupancy[seatId] = { occupied, by };
+        // si liberaron la que yo tenía, regresar a vista profe
         if(currentSeatId === seatId && (!occupied || by !== socket.id)){
           currentSeatId = null;
           setTeacherView();
@@ -175,21 +225,21 @@
         refreshSeatButtons();
       });
 
-      socket.on("disconnect", ()=>{
+      socket.on('disconnect', ()=>{
         connectedToServer = false;
-        statusEl.textContent = "Desconectado (modo demo)";
+        statusEl.textContent = 'Desconectado del servidor. Modo DEMO.';
+        statusEl.className = 'status-warn';
         refreshSeatButtons();
       });
 
-      window.addEventListener("beforeunload", () => {
-        if(socket?.connected && currentSeatId){
-          socket.emit("release_seat", { seatId: currentSeatId });
-        }
+      // Liberar asiento al salir
+      window.addEventListener('beforeunload', ()=>{
+        if(socket?.connected && currentSeatId){ socket.emit('release_seat', { seatId: currentSeatId }); }
       });
     }
 
     // =====================
-    // THREE.JS + CÁMARA
+    // ESCENA 3D (Three.js)
     // =====================
     function initScene(){
       scene = new THREE.Scene();
@@ -197,102 +247,158 @@
 
       camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
 
-      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setSize(window.innerWidth, window.innerHeight);
-      document.getElementById("container").appendChild(renderer.domElement);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.getElementById('container').appendChild(renderer.domElement);
 
-      const amb = new THREE.AmbientLight(0xffffff, 0.6); scene.add(amb);
-      const dir = new THREE.DirectionalLight(0xffffff, 0.85);
-      dir.position.set(0,20,10); scene.add(dir);
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.65); scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.85);
+      directionalLight.position.set(0,20,10); directionalLight.castShadow = true; scene.add(directionalLight);
 
       createClassroom();
       setupBasicControls();
-
       animate();
-    }
 
-    function createClassroom(){
-      const floor = new THREE.Mesh(
-        new THREE.PlaneGeometry(26,28),
-        new THREE.MeshLambertMaterial({color:0xcccccc})
-      );
-      floor.rotation.x = -Math.PI/2;
-      scene.add(floor);
-
-      createStudentDesks();
-    }
-
-    function createStudentDesks(){
-      const startZ=-6, spacingZ=4, spacingX=4, startX=-10;
-
-      for(const seatId of SEAT_IDS){
-        const r = seatId.charAt(0);
-        const c = parseInt(seatId.slice(1));
-        const rowIndex = ROWS.indexOf(r);
-        const colIndex = c-1;
-
-        const x = startX + colIndex*spacingX;
-        const z = startZ + rowIndex*spacingZ;
-
-        const desk = new THREE.Mesh(
-          new THREE.BoxGeometry(1.4,.06,.9),
-          new THREE.MeshLambertMaterial({color:0xdeb887})
-        );
-        desk.position.set(x,.82,z);
-        scene.add(desk);
-
-        deskPositions[seatId] = {x, y:1.7, z:z+0.85};
-      }
-    }
-
-    function setupBasicControls(){
-      let md=false, mx=0, my=0;
-      renderer.domElement.addEventListener('mousedown', e=>{ md=true; mx=e.clientX; my=e.clientY; });
-      renderer.domElement.addEventListener('mouseup', ()=> md=false );
-      renderer.domElement.addEventListener('mousemove', e=>{
-        if(!md) return;
-        const dx=e.clientX-mx, dy=e.clientY-my;
-        if(!isTeacherView){
-          camera.rotation.y -= dx*0.005;
-          camera.rotation.x -= dy*0.005;
-        }
-        mx=e.clientX; my=e.clientY;
+      window.addEventListener('resize', ()=>{
+        camera.aspect = window.innerWidth/window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
       });
     }
 
-    function getFrontLookVector(){ return {x:0, y:1.2, z:-14}; }
+    function createClassroom(){
+      const floor = new THREE.Mesh(new THREE.PlaneGeometry(26, 28), new THREE.MeshLambertMaterial({ color: 0xcccccc }));
+      floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
 
-    function animateCameraTo(x,y,z, lx,ly,lz){
-      const start = camera.position.clone();
-      const end = new THREE.Vector3(x,y,z);
-      const t0 = performance.now();
-      const dur = 900;
+      const wallMat = new THREE.MeshLambertMaterial({ color: 0xe8f4fd });
+      const frontWall = new THREE.Mesh(new THREE.PlaneGeometry(26,8), wallMat); frontWall.position.set(0,4,-14); scene.add(frontWall);
+      const backWall = new THREE.Mesh(new THREE.PlaneGeometry(26,8), wallMat); backWall.position.set(0,4,14); backWall.rotation.y = Math.PI; scene.add(backWall);
+      const leftWall = new THREE.Mesh(new THREE.PlaneGeometry(28,8), wallMat); leftWall.position.set(-13,4,0); leftWall.rotation.y = Math.PI/2; scene.add(leftWall);
+      const rightWall = new THREE.Mesh(new THREE.PlaneGeometry(28,8), wallMat); rightWall.position.set(13,4,0); rightWall.rotation.y = -Math.PI/2; scene.add(rightWall);
 
+      // Pizarrón
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(10,3,.1), new THREE.MeshLambertMaterial({ color: 0x8b4513 })); frame.position.set(0,3,-13.9); scene.add(frame);
+      const board = new THREE.Mesh(new THREE.PlaneGeometry(9.6,2.6), new THREE.MeshLambertMaterial({ color: 0x1a4d1a })); board.position.set(0,3,-13.85); scene.add(board);
+
+      // Escritorio del profesor
+      const matDesk = new THREE.MeshLambertMaterial({ color: 0x8b4513 });
+      const desk = new THREE.Mesh(new THREE.BoxGeometry(3.5,.12,1.7), matDesk); desk.position.set(0,1,-10.5); desk.castShadow = true; scene.add(desk);
+      for(let i=0;i<4;i++){
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(.12,1,.12), matDesk);
+        const x = (i%2===0)?-1.6:1.6; const z = (i<2)?-0.8:0.8; leg.position.set(x, .5, -10.5+z); leg.castShadow = true; scene.add(leg);
+      }
+
+      // Bancas (auto-layout basado en SEAT_IDS)
+      createStudentDesks();
+
+      // Posters fijos (usar tu carpeta img/)
+      createPosters();
+    }
+
+    function createStudentDesks(){
+      // Distribución en 4 filas (A–D), 6 columnas, solo primeras 22 entradas
+      const startZ = -6; // fila A cerca del frente
+      const spacingZ = 4; // separación filas
+      const spacingX = 4; // separación columnas
+      const startX = -10; // columna 1 a la izquierda
+
+      const seatToGrid = (seatId)=>{
+        const r = seatId.charAt(0); const c = parseInt(seatId.slice(1),10);
+        const rowIndex = ROWS.indexOf(r); const colIndex = c-1; return { rowIndex, colIndex };
+      };
+
+      for(const seatId of SEAT_IDS){
+        const { rowIndex, colIndex } = seatToGrid(seatId);
+        const x = startX + colIndex * spacingX;
+        const z = startZ + rowIndex * spacingZ;
+
+        const desk = new THREE.Mesh(new THREE.BoxGeometry(1.4,.06,.9), new THREE.MeshLambertMaterial({ color: 0xdeb887 }));
+        desk.position.set(x,.82,z); desk.castShadow = true; scene.add(desk);
+        for(let i=0;i<4;i++){
+          const leg = new THREE.Mesh(new THREE.BoxGeometry(.06,.82,.06), new THREE.MeshLambertMaterial({ color: 0xdeb887 }));
+          const lx = x + (i%2===0?-0.6:0.6); const lz = z + (i<2?-0.34:0.34); leg.position.set(lx,.41,lz); leg.castShadow = true; scene.add(leg);
+        }
+        const chair = new THREE.Mesh(new THREE.BoxGeometry(.85,.05,.85), new THREE.MeshLambertMaterial({ color: 0x4169e1 })); chair.position.set(x,.52,z+.85); chair.castShadow = true; scene.add(chair);
+        const backrest = new THREE.Mesh(new THREE.BoxGeometry(.85,.65,.06), new THREE.MeshLambertMaterial({ color: 0x4169e1 })); backrest.position.set(x,.86,z+1.18); backrest.castShadow = true; scene.add(backrest);
+
+        // posición de cámara (ojos sentado)
+        deskPositions[seatId] = { x, y: 1.7, z: z + 0.85 };
+      }
+    }
+
+    function createPosters(){
+      // Laterales (tres por lado)
+      const makePoster = (x, y, z, ry, w, h, path)=>{
+        const geo = new THREE.PlaneGeometry(w,h);
+        const mat = new THREE.MeshLambertMaterial({});
+        const mesh = new THREE.Mesh(geo, mat); mesh.position.set(x,y,z); mesh.rotation.y = ry; scene.add(mesh);
+        new THREE.TextureLoader().load(path, tex=>{ mat.map = tex; mat.needsUpdate = true; }, ()=>{ mat.color = new THREE.Color(0x999999); mat.needsUpdate = true; });
+      };
+      // paredes
+      const leftX = -12.95, rightX = 12.95; const baseY = 3.6; const baseZ = -6; const dz = 5;
+      for(let i=0;i<3;i++){
+        makePoster(leftX, baseY, baseZ + i*dz, Math.PI/2, 2.5, 3.3, `img/left${i}.jpg`);
+        makePoster(rightX, baseY, baseZ + i*dz, -Math.PI/2, 2.5, 3.3, `img/right${i}.jpg`);
+      }
+      // pared trasera
+      makePoster(0, 5, 13.95, Math.PI, 6, 3.6, 'img/back.jpg');
+    }
+
+    function setupBasicControls(){
+      let mouseDown=false, mouseX=0, mouseY=0;
+      renderer.domElement.addEventListener('mousedown', e=>{ mouseDown=true; mouseX=e.clientX; mouseY=e.clientY; });
+      renderer.domElement.addEventListener('mouseup', ()=>{ mouseDown=false; });
+      renderer.domElement.addEventListener('mousemove', e=>{
+        if(!mouseDown) return;
+        const dx = e.clientX - mouseX; const dy = e.clientY - mouseY;
+        if(!isTeacherView){
+          camera.rotation.y -= dx * 0.005;
+          camera.rotation.x -= dy * 0.005;
+          camera.rotation.x = Math.max(-Math.PI/3, Math.min(Math.PI/3, camera.rotation.x));
+        }
+        mouseX = e.clientX; mouseY = e.clientY;
+      });
+    }
+
+    function getFrontLookVector(){ return { x: 0, y: 1.2, z: -14 }; }
+
+    function animateCameraTo(x,y,z, lookX,lookY,lookZ){
+      const startPos = camera.position.clone();
+      const targetPos = new THREE.Vector3(x,y,z);
+      const startTime = performance.now(); const duration = 900;
       (function anim(){
-        const p = Math.min((performance.now()-t0)/dur, 1);
-        const s = 1 - Math.pow(1-p,3);
-        camera.position.lerpVectors(start, end, s);
-        camera.lookAt(lx,ly,lz);
+        const now = performance.now(); const p = Math.min((now-startTime)/duration,1); const t = 1 - Math.pow(1-p,3);
+        camera.position.lerpVectors(startPos, targetPos, t); camera.lookAt(lookX,lookY,lookZ);
         if(p<1) requestAnimationFrame(anim);
       })();
     }
 
-    function setDeskViewById(seatId){
-      const p = deskPositions[seatId];
-      const look = getFrontLookVector();
-      currentSeatId = seatId;
-      isTeacherView = false;
-      animateCameraTo(p.x,p.y,p.z, look.x,look.y,look.z);
+    function updateCurrentView(){
+      const viewEl = document.getElementById('currentView'); const posEl = document.getElementById('currentPosition');
+      if(isTeacherView){ viewEl.textContent='👨‍🏫 Vista del Profesor'; posEl.textContent='Escritorio del profesor'; }
+      else if(currentSeatId){ viewEl.textContent = `🪑 Banca ${currentSeatId}`; posEl.textContent = `Fila ${currentSeatId.charAt(0)}, Asiento ${currentSeatId.slice(1)}`; }
+      else { viewEl.textContent='—'; posEl.textContent='—'; }
     }
 
-    function setTeacherView(){
-      isTeacherView = true;
-      animateCameraTo(0,1.8,-10, 0,1.2,8);
-    }
+    function animate(){ requestAnimationFrame(animate); renderer.render(scene,camera); }
 
-    function animate(){
-      requestAnimationFrame(animate);
-      renderer.render(scene,camera);
+    // =====================
+    // TESTS BÁSICOS
+    // =====================
+    function runSelfTests(){
+      try {
+        console.group('%cSelf-tests','color:#0bf');
+        console.assert(Array.isArray(ROWS) && ROWS.length===4, 'Filas A–D');
+        console.assert(SEAT_IDS.length===22, '22 asientos generados');
+        console.assert(typeof setTeacherView==='function', 'setTeacherView existe');
+        console.assert(typeof setDeskViewById==='function', 'setDeskViewById existe');
+        // Simular toma de una banca local (sin servidor)
+        if(!connectedToServer){ setDeskViewById(SEAT_IDS[0]); }
+        console.log('Self-tests OK');
+        console.groupEnd();
+      } catch(e){ console.error('Self-tests fallaron:', e); }
     }
   </script>
 </body>
