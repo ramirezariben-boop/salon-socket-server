@@ -131,8 +131,8 @@
     function tryConnectSocket(){
       const s = document.createElement("script");
 
-      // ⬇️ **REEMPLAZA ESTE DOMINIO POR EL TUYO**
-      s.src = "https://TU-SERVIDOR.onrender.com/socket.io/socket.io.js";
+ s.src = "https://salon-socket-server.onrender.com/socket.io/socket.io.js";
+
 
       s.onload = setupSocket;
       s.onerror = () => {
@@ -146,8 +146,7 @@
     function setupSocket(){
       if(!window.io) return;
 
-      // ⬇️ **REEMPLAZA ESTE DOMINIO POR EL TUYO**
-      socket = window.io("https://TU-SERVIDOR.onrender.com");
+      socket = window.io("https://salon-socket-server.onrender.com");
 
       socket.on("connect", () => {
         connectedToServer = true;
