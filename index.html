@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Salón de Clases Virtual — 22 Bancas con Bloqueo en Tiempo Real</title>
+
+  <!-- Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <style>
+    body { margin: 0; padding: 0; background: #0f1115; font-family: Arial, sans-serif; overflow: hidden; color: #fff; }
+    #container { width: 100vw; height: 100vh; position: relative; }
+    #controls { position: absolute; top: 16px; left: 16px; z-index: 100; background: rgba(0,0,0,0.85); color: #fff; padding: 14px; border-radius: 10px; max-width: 320px; }
+    .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+    .desk-button { padding: 8px 10px; background: #4a90e2; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 12px; transition: .15s; text-align: center; }
+    .desk-button:hover { transform: translateY(-1px); background: #357abd; }
+    .desk-button.current { background: #27ae60; box-shadow: 0 0 10px rgba(39,174,96,.6); }
+    .desk-button.occupied { background: #e74c3c; cursor: not-allowed; }
+    .teacher-button { display: block; width: 100%; margin: 8px 0 10px; padding: 10px; background: #f39c12; border: 0; border-radius: 6px; color: #fff; font-weight: 700; cursor: pointer; }
+    .teacher-button:hover { background: #e67e22; }
+    #info { position: absolute; bottom: 16px; left: 16px; z-index: 100; background: rgba(0,0,0,0.7); color: #fff; padding: 12px 14px; border-radius: 8px; max-width: 360px; }
+    #status { position: absolute; top: 16px; right: 16px; z-index: 100; background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 8px; min-width: 260px; }
+    .status-ok { color: #7fffb3; }
+    .status-warn { color: #ffd166; }
+  </style>
+</head>
+<body>
+
+  <div id="container">
+    <div id="controls">
+      <h3 style="margin:0 0 8px">🎓 Seleccionar Banca (22 lugares)</h3>
+      <button class="teacher-button" id="teacherBtn">👨‍🏫 Vista del Profesor</button>
+      <div id="seatsGrid" class="grid"></div>
+    </div>
+
+    <div id="status">Estado: <span id="statusText" class="status-warn">Iniciando…</span></div>
+
+    <div id="info">
+      <strong>Vista actual:</strong> <span id="currentView">—</span><br>
+      <strong>Posición:</strong> <span id="currentPosition">—</span><br><br>
+      <small>💡 Haz clic en una banca para tomarla. Las bancas ocupadas se bloquean en tiempo real. Arrastra con el mouse para mirar alrededor.</small>
+    </div>
+  </div>
+
+  <script>
+    // =====================
+    // CONFIGURACIÓN DE ASIENTOS
+    // =====================
+    const ROWS = ['A','B','C','D'];
+    const COLS = [1,2,3,4,5,6];
+    const ACTIVE_SEAT_COUNT = 22;
+
+    function generateSeatIds(){
+      const ids = [];
+      for(const r of ROWS) for(const c of COLS) ids.push(`${r}${c}`);
+      return ids.slice(0, ACTIVE_SEAT_COUNT);
+    }
+    const SEAT_IDS = generateSeatIds();
+
+    // =====================
+    // VARIABLES GLOBALES
+    // =====================
+    let scene, camera, renderer;
+    const deskPositions = {};
+    let currentSeatId = null;
+    let isTeacherView = false;
+    let socket = null;
+    let connectedToServer = false;
+    let occupancy = {};
+
+    const statusEl = document.getElementById('statusText');
+    const gridEl = document.getElementById('seatsGrid');
+    const teacherBtn = document.getElementById('teacherBtn');
+
+    // =====================
+    // INIT
+    // =====================
+    window.addEventListener('DOMContentLoaded', () => {
+      buildSeatButtons();
+      initScene();
+      tryConnectSocket();
+      teacherBtn.addEventListener("click", setTeacherView);
+      setTimeout(setTeacherView, 80);
+    });
+
+    // =====================
+    // SEATS UI
+    // =====================
+    function buildSeatButtons(){
+      gridEl.innerHTML = '';
+      for(const seatId of SEAT_IDS){
+        const btn = document.createElement('button');
+        btn.className = 'desk-button';
+        btn.textContent = seatId;
+        btn.id = `btn-${seatId}`;
+        btn.addEventListener('click', ()=> handleSeatClick(seatId));
+        gridEl.appendChild(btn);
+      }
+    }
+
+    function handleSeatClick(seatId){
+      if(!connectedToServer){
+        setDeskViewById(seatId);
+        return;
+      }
+
+      const occ = occupancy[seatId];
+      if(occ?.occupied && occ.by !== socket.id) return;
+
+      socket.emit("request_seat", { seatId });
+    }
+
+    function refreshSeatButtons(){
+      for(const seatId of SEAT_IDS){
+        const btn = document.getElementById(`btn-${seatId}`);
+        const occ = occupancy[seatId];
+
+        btn.classList.remove('current','occupied');
+
+        if(occ?.occupied){
+          if(occ.by === socket?.id) btn.classList.add('current');
+          else btn.classList.add('occupied');
+        }
+      }
+    }
+
+    // =====================
+    // SOCKET.IO
+    // =====================
+    function tryConnectSocket(){
+      const s = document.createElement("script");
+
+      // ⬇️ **REEMPLAZA ESTE DOMINIO POR EL TUYO**
+      s.src = "https://TU-SERVIDOR.onrender.com/socket.io/socket.io.js";
+
+      s.onload = setupSocket;
+      s.onerror = () => {
+        connectedToServer = false;
+        statusEl.textContent = "Modo DEMO: sin servidor";
+        refreshSeatButtons();
+      };
+      document.head.appendChild(s);
+    }
+
+    function setupSocket(){
+      if(!window.io) return;
+
+      // ⬇️ **REEMPLAZA ESTE DOMINIO POR EL TUYO**
+      socket = window.io("https://TU-SERVIDOR.onrender.com");
+
+      socket.on("connect", () => {
+        connectedToServer = true;
+        statusEl.textContent = "Conectado al servidor";
+        statusEl.className = "status-ok";
+      });
+
+      socket.on("state", (serverState)=>{
+        occupancy = serverState.occupancy;
+        refreshSeatButtons();
+      });
+
+      socket.on("seat_granted", ({ seatId })=>{
+        occupancy[seatId] = { occupied:true, by:socket.id };
+        currentSeatId = seatId;
+        setDeskViewById(seatId);
+        refreshSeatButtons();
+      });
+
+      socket.on("seat_update", ({ seatId, occupied, by })=>{
+        occupancy[seatId] = { occupied, by };
+        if(currentSeatId === seatId && (!occupied || by !== socket.id)){
+          currentSeatId = null;
+          setTeacherView();
+        }
+        refreshSeatButtons();
+      });
+
+      socket.on("disconnect", ()=>{
+        connectedToServer = false;
+        statusEl.textContent = "Desconectado (modo demo)";
+        refreshSeatButtons();
+      });
+
+      window.addEventListener("beforeunload", () => {
+        if(socket?.connected && currentSeatId){
+          socket.emit("release_seat", { seatId: currentSeatId });
+        }
+      });
+    }
+
+    // =====================
+    // THREE.JS + CÁMARA
+    // =====================
+    function initScene(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf0f8ff);
+
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.getElementById("container").appendChild(renderer.domElement);
+
+      const amb = new THREE.AmbientLight(0xffffff, 0.6); scene.add(amb);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+      dir.position.set(0,20,10); scene.add(dir);
+
+      createClassroom();
+      setupBasicControls();
+
+      animate();
+    }
+
+    function createClassroom(){
+      const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(26,28),
+        new THREE.MeshLambertMaterial({color:0xcccccc})
+      );
+      floor.rotation.x = -Math.PI/2;
+      scene.add(floor);
+
+      createStudentDesks();
+    }
+
+    function createStudentDesks(){
+      const startZ=-6, spacingZ=4, spacingX=4, startX=-10;
+
+      for(const seatId of SEAT_IDS){
+        const r = seatId.charAt(0);
+        const c = parseInt(seatId.slice(1));
+        const rowIndex = ROWS.indexOf(r);
+        const colIndex = c-1;
+
+        const x = startX + colIndex*spacingX;
+        const z = startZ + rowIndex*spacingZ;
+
+        const desk = new THREE.Mesh(
+          new THREE.BoxGeometry(1.4,.06,.9),
+          new THREE.MeshLambertMaterial({color:0xdeb887})
+        );
+        desk.position.set(x,.82,z);
+        scene.add(desk);
+
+        deskPositions[seatId] = {x, y:1.7, z:z+0.85};
+      }
+    }
+
+    function setupBasicControls(){
+      let md=false, mx=0, my=0;
+      renderer.domElement.addEventListener('mousedown', e=>{ md=true; mx=e.clientX; my=e.clientY; });
+      renderer.domElement.addEventListener('mouseup', ()=> md=false );
+      renderer.domElement.addEventListener('mousemove', e=>{
+        if(!md) return;
+        const dx=e.clientX-mx, dy=e.clientY-my;
+        if(!isTeacherView){
+          camera.rotation.y -= dx*0.005;
+          camera.rotation.x -= dy*0.005;
+        }
+        mx=e.clientX; my=e.clientY;
+      });
+    }
+
+    function getFrontLookVector(){ return {x:0, y:1.2, z:-14}; }
+
+    function animateCameraTo(x,y,z, lx,ly,lz){
+      const start = camera.position.clone();
+      const end = new THREE.Vector3(x,y,z);
+      const t0 = performance.now();
+      const dur = 900;
+
+      (function anim(){
+        const p = Math.min((performance.now()-t0)/dur, 1);
+        const s = 1 - Math.pow(1-p,3);
+        camera.position.lerpVectors(start, end, s);
+        camera.lookAt(lx,ly,lz);
+        if(p<1) requestAnimationFrame(anim);
+      })();
+    }
+
+    function setDeskViewById(seatId){
+      const p = deskPositions[seatId];
+      const look = getFrontLookVector();
+      currentSeatId = seatId;
+      isTeacherView = false;
+      animateCameraTo(p.x,p.y,p.z, look.x,look.y,look.z);
+    }
+
+    function setTeacherView(){
+      isTeacherView = true;
+      animateCameraTo(0,1.8,-10, 0,1.2,8);
+    }
+
+    function animate(){
+      requestAnimationFrame(animate);
+      renderer.render(scene,camera);
+    }
+  </script>
+</body>
+</html>
